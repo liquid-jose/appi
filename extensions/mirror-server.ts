@@ -292,9 +292,51 @@ export default function (pi: ExtensionAPI) {
   let tailscaleUrl = "";
 
   // ═══════════════════════════════════════
+  // Optional: exit Pi when the last browser window closes
+  // Opt-in with TAU_EXIT_WHEN_CLOSED=<seconds> (the apPi launcher sets it).
+  // Waits for the agent to be idle and never exits while a tmux client is
+  // attached to this Pi's terminal.
+  // ═══════════════════════════════════════
+  const EXIT_WHEN_CLOSED_SECONDS = Math.max(0, Number(process.env.TAU_EXIT_WHEN_CLOSED || 0) || 0);
+  let exitTimer: NodeJS.Timeout | null = null;
+
+  function cancelExitCheck() {
+    if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
+  }
+
+  function scheduleExitCheck(delayMs: number) {
+    if (!EXIT_WHEN_CLOSED_SECONDS) return;
+    cancelExitCheck();
+    exitTimer = setTimeout(() => { exitIfAbandoned().catch(() => {}); }, delayMs);
+  }
+
+  function tmuxClientAttached(): Promise<boolean> {
+    const pane = process.env.TMUX_PANE;
+    if (!process.env.TMUX || !pane) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const { execFile } = require("node:child_process");
+      execFile("tmux", ["display-message", "-p", "-t", pane, "#{session_attached}"], (err: any, out: string) => {
+        resolve(!err && Number(String(out).trim()) > 0);
+      });
+    });
+  }
+
+  async function exitIfAbandoned() {
+    exitTimer = null;
+    if (!server || clients.size > 0 || !latestCtx) return; // stopping, switching, or in use
+    const ctx = latestCtx;
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) { scheduleExitCheck(10_000); return; }
+    if (await tmuxClientAttached()) { scheduleExitCheck(30_000); return; }
+    if (clients.size > 0) return;
+    console.log("[Mirror] Last browser window closed, shutting down Pi (TAU_EXIT_WHEN_CLOSED)");
+    ctx.shutdown();
+  }
+
+  // ═══════════════════════════════════════
   // Helper: stop the server
   // ═══════════════════════════════════════
   function stopServer() {
+    cancelExitCheck();
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -1673,6 +1715,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     wss.on("connection", (ws) => {
       console.log("[Mirror] Browser client connected");
       clients.add(ws);
+      cancelExitCheck();
       (ws as any).isAlive = true;
 
       ws.on("pong", () => {
@@ -1701,11 +1744,13 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       ws.on("close", () => {
         console.log("[Mirror] Browser client disconnected");
         clients.delete(ws);
+        if (server && clients.size === 0) scheduleExitCheck(EXIT_WHEN_CLOSED_SECONDS * 1000);
       });
 
       ws.on("error", (e) => {
         console.error("[Mirror] Client error:", e);
         clients.delete(ws);
+        if (server && clients.size === 0) scheduleExitCheck(EXIT_WHEN_CLOSED_SECONDS * 1000);
       });
     });
 
@@ -1825,6 +1870,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       // Register this instance
       const sessionFile = ctx.sessionManager.getSessionFile() || "";
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
+
+      // If nobody ever connects (or reconnects after a session switch), exit eventually
+      if (clients.size === 0) scheduleExitCheck(Math.max(EXIT_WHEN_CLOSED_SECONDS, 120) * 1000);
 
       ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
     };

@@ -1,5 +1,7 @@
 # Tau
 
+> **About this fork:** [deflating/tau](https://github.com/deflating/tau) is retired. This fork adds one feature on top of the last upstream release: **Continue session**. Right-click any session in the sidebar (or use the button above the composer) to resume it in the running Pi, the browser equivalent of `pi -r`. Install with `pi install git:github.com/liquid-jose/tau`. Same idea as the unmerged upstream PR [#69](https://github.com/deflating/tau/pull/69) by @Elompenta.
+
 A web UI that mirrors your [Pi](https://github.com/badlogic/pi-mono) terminal session in the browser. No separate server — it runs as a Pi extension inside your existing process.
 
 ![Tau dark mode](docs/images/dark.png)

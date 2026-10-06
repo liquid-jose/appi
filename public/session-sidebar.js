@@ -3,9 +3,14 @@
  */
 
 export class SessionSidebar {
-  constructor(container, onSessionSelect) {
+  constructor(container, onSessionSelect, options = {}) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
+    // Optional hooks provided by the app:
+    //   getLiveState(filePath) -> 'active' | 'other' | 'none'
+    //   onContinueSession(session, project)
+    this.getLiveState = options.getLiveState || (() => 'none');
+    this.onContinueSession = options.onContinueSession || null;
     this.activeSessionFile = null;
     this.projects = [];
     this.collapsedProjects = new Set();
@@ -221,12 +226,21 @@ export class SessionSidebar {
     const menu = document.createElement('div');
     menu.className = 'session-context-menu';
 
-    const items = [
+    const items = [];
+    if (this.onContinueSession) {
+      const live = this.getLiveState(session.filePath);
+      if (live === 'none') {
+        items.push({ icon: '▶', label: 'Continue session', action: () => this.onContinueSession(session, project) });
+      } else if (live === 'other') {
+        items.push({ icon: '↗', label: 'Go to live session', action: () => this.onSessionSelect(session, project) });
+      }
+    }
+    items.push(
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
       { icon: '✎', label: 'Rename', action: () => this.startRename(itemEl) },
       { icon: '📋', label: 'Export HTML', action: () => this.exportSession(session) },
       { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session, itemEl) },
-    ];
+    );
 
     for (const item of items) {
       const row = document.createElement('div');

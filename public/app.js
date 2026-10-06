@@ -24,7 +24,11 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
 // Session sidebar
 const sidebar = new SessionSidebar(
   document.getElementById('session-list'),
-  handleSessionSelect
+  handleSessionSelect,
+  {
+    getLiveState: (filePath) => getSessionLiveState(filePath),
+    onContinueSession: (session, project) => continueSession(session, project),
+  }
 );
 
 // UI elements
@@ -1048,6 +1052,7 @@ newSessionBtn.addEventListener('click', () => {
   toolCardRenderer.clear();
   messageRenderer.renderWelcome();
   sidebar.clearActive();
+  viewedSession = null;
   viewingActiveSession = true;
   updateMirrorInputState();
 });
@@ -1123,6 +1128,7 @@ async function newSession() {
 }
 
 async function handleSessionSelect(session, project) {
+  viewedSession = session ? { session, project } : null;
   sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -1229,6 +1235,11 @@ function handleMirrorSync(data) {
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
   viewingActiveSession = true;
+  if (continuingSession && continuingSession === mirrorActiveSessionFile) {
+    continuingSession = null;
+    sidebar.setActive(mirrorActiveSessionFile);
+    sidebar.loadSessions().then(() => pollInstances());
+  }
   updateMirrorInputState();
   updateMirrorLiveIndicator();
 
@@ -1281,6 +1292,7 @@ async function pollInstances() {
       const data = await res.json();
       liveInstances = data.instances || [];
       updateMirrorLiveIndicator();
+      updateContinueBanner();
     }
   } catch {}
 }
@@ -1303,6 +1315,124 @@ function updateMirrorInputState() {
     messageInput.placeholder = 'Viewing historical session (read-only)';
     inputArea?.classList.add('mirror-readonly');
   }
+  updateContinueBanner();
+}
+
+// ═══════════════════════════════════════
+// Continue a historical session (equivalent to `pi -r`)
+// ═══════════════════════════════════════
+let viewedSession = null;        // { session, project } last opened from the sidebar
+let continuingSession = null;    // file path being resumed, while the switch is in flight
+const continueBanner = document.getElementById('continue-banner');
+const continueBannerText = document.getElementById('continue-banner-text');
+const continueSessionBtn = document.getElementById('continue-session-btn');
+
+function currentInstancePort() {
+  try { return Number(new URL(wsClient.url).port) || Number(location.port); } catch { return Number(location.port); }
+}
+
+// 'active' = live in this tab's instance, 'other' = live in another Pi, 'none' = historical
+function getSessionLiveState(filePath) {
+  if (!filePath) return 'none';
+  if (filePath === mirrorActiveSessionFile) return 'active';
+  const port = currentInstancePort();
+  if (liveInstances.some(i => i.sessionFile === filePath && i.port !== port)) return 'other';
+  return 'none';
+}
+
+function updateContinueBanner() {
+  if (!continueBanner) return;
+  const filePath = viewedSession?.session?.filePath;
+  const show = isMirrorMode && !viewingActiveSession && !!filePath;
+  continueBanner.classList.toggle('hidden', !show);
+  if (!show) return;
+  const live = getSessionLiveState(filePath);
+  if (continuingSession === filePath) {
+    continueBannerText.textContent = 'Resuming session in this Pi instance...';
+    continueSessionBtn.disabled = true;
+  } else if (live === 'other') {
+    continueBannerText.textContent = 'This session is live in another Pi instance';
+    continueSessionBtn.disabled = false;
+    continueSessionBtn.innerHTML = '&#8599; Go to live session';
+  } else {
+    continueBannerText.textContent = 'Viewing a historical session (read-only)';
+    continueSessionBtn.disabled = false;
+    continueSessionBtn.innerHTML = '&#9654; Continue session';
+  }
+}
+
+continueSessionBtn?.addEventListener('click', () => {
+  if (!viewedSession) return;
+  const { session, project } = viewedSession;
+  if (getSessionLiveState(session.filePath) === 'other') {
+    handleSessionSelect(session, project);
+  } else {
+    continueSession(session, project);
+  }
+});
+
+async function continueSession(session, project) {
+  if (!session?.filePath || continuingSession) return;
+  // Make sure the transcript being resumed is the one on screen
+  if (viewedSession?.session?.filePath !== session.filePath || viewingActiveSession) {
+    await handleSessionSelect(session, project);
+  }
+  viewedSession = { session, project };
+  continuingSession = session.filePath;
+  updateContinueBanner();
+
+  try {
+    const res = await fetch('/api/sessions/continue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: session.filePath }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (data.alreadyActive) {
+      continuingSession = null;
+      mirrorActiveSessionFile = session.filePath;
+      viewingActiveSession = true;
+      updateMirrorInputState();
+      wsClient.send({ type: 'mirror_sync_request' });
+      return;
+    }
+    // Pi now replaces its session: the extension restarts and the websocket
+    // reconnects; the next mirror_sync carries the resumed session.
+    setTimeout(() => waitForContinuedSession(session.filePath), 500);
+  } catch (e) {
+    continuingSession = null;
+    updateContinueBanner();
+    messageRenderer.renderError(`Could not continue session: ${e.message}`);
+  }
+}
+
+// Fallback in case the server came back on a different port
+async function waitForContinuedSession(filePath, attempt = 0) {
+  if (continuingSession !== filePath) return; // mirror_sync already handled it
+  if (attempt > 40) {
+    continuingSession = null;
+    updateContinueBanner();
+    messageRenderer.renderError('Timed out waiting for Pi to resume the session. Check the terminal.');
+    return;
+  }
+  try {
+    const res = await fetch('/api/instances', { cache: 'no-store' });
+    if (res.ok) {
+      const { instances = [] } = await res.json();
+      const target = instances.find(i => i.sessionFile === filePath);
+      if (target && target.port !== currentInstancePort()) {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsClient.disconnect();
+        wsClient.url = `${protocol}//${location.hostname}:${target.port}/ws`;
+        wsClient.forceReconnect();
+      } else if (target && wsClient.ws?.readyState !== WebSocket.OPEN) {
+        // Server is back on the same port: skip the reconnect backoff
+        wsClient.forceReconnect();
+      }
+    }
+  } catch {}
+  setTimeout(() => waitForContinuedSession(filePath, attempt + 1), 500);
 }
 
 // ═══════════════════════════════════════

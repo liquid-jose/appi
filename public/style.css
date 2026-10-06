@@ -749,8 +749,34 @@ body {
   animation: pulse 2s infinite;
 }
 
+/* Continue banner: resume a historical session in this Pi instance */
+.continue-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 2px 16px 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.continue-banner.hidden { display: none; }
+.continue-banner-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-sm);
+  background: var(--accent-subtle);
+  color: var(--accent-text);
+  font: inherit;
+  cursor: pointer;
+}
+.continue-banner-btn:hover:not(:disabled) { background: var(--accent-glow); border-color: var(--accent); }
+.continue-banner-btn:disabled { opacity: 0.5; cursor: default; }
+
 /* Mirror mode: read-only input */
-.input-area.mirror-readonly {
+/* Only the composer is dimmed, so the Continue banner stays usable */
+.input-area.mirror-readonly #chat-form,
+.input-area.mirror-readonly .mobile-model-bar,
+.input-area.mirror-readonly .mobile-context-toggle {
   opacity: 0.5;
   pointer-events: none;
 }

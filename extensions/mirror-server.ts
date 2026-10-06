@@ -214,8 +214,49 @@ function sendAuthRequired(res: http.ServerResponse) {
   res.end(JSON.stringify({ error: "Unauthorized" }));
 }
 
+// Reject browser requests coming from another origin (CSRF guard for
+// state-changing endpoints). Requests without an Origin header (curl, same-
+// origin GETs) are allowed.
+function isSameOriginRequest(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+// Validate a session file the web UI asks to continue.
+function validateContinueTarget(filePath: unknown):
+  | { ok: true; path: string }
+  | { ok: false; status: number; error: string; port?: number } {
+  if (!filePath || typeof filePath !== "string") return { ok: false, status: 400, error: "filePath required" };
+  const resolved = path.resolve(filePath);
+  const root = path.resolve(SESSIONS_DIR) + path.sep;
+  if (!resolved.startsWith(root) || !resolved.endsWith(".jsonl")) {
+    return { ok: false, status: 400, error: "Not a Pi session file" };
+  }
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+    return { ok: false, status: 404, error: "Session not found" };
+  }
+  // Never open the same session file from two Pi processes at once.
+  const other = getRunningInstances().find(
+    (i) => i.pid !== process.pid && i.sessionFile && path.resolve(i.sessionFile) === resolved,
+  );
+  if (other) {
+    return { ok: false, status: 409, error: `Session is already live in another Pi instance (port ${other.port})`, port: other.port };
+  }
+  return { ok: true, path: resolved };
+}
+
+// Port of the server in this process, remembered across session switches
+// (each switch reloads the extension in the same process).
+const TAU_PORT_KEY = "__tauMirrorLastPort";
+
 export default function (pi: ExtensionAPI) {
   let server: http.Server | null = null;
+  let currentPort: number | null = (globalThis as any)[TAU_PORT_KEY] ?? null;
   let wss: WebSocketServer | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
   const clients = new Set<WebSocket>();
@@ -267,6 +308,9 @@ export default function (pi: ExtensionAPI) {
       wss = null;
     }
     if (server) {
+      // Free the port right away so a session switch can rebind it
+      // (server.close() alone waits for keep-alive connections to drain).
+      try { (server as any).closeAllConnections?.(); } catch {}
       server.close();
       server = null;
     }
@@ -289,6 +333,30 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("mirror", "");
       ctx.ui.notify("Tau mirror server stopped", "info");
       console.log("[Mirror] Server stopped via /taustop");
+    },
+  });
+
+  // ═══════════════════════════════════════
+  // /tau-continue — resume a historical session (equivalent to `pi -r`)
+  // Invoked by the web UI through POST /api/sessions/continue. Session
+  // replacement is only allowed from command handlers, hence the command.
+  // ═══════════════════════════════════════
+  pi.registerCommand("tau-continue", {
+    description: "Continue (resume) a session file in this Pi instance",
+    handler: async (args, ctx) => {
+      let target = (args || "").trim();
+      try { target = decodeURIComponent(target); } catch {}
+      const check = validateContinueTarget(target);
+      if (!check.ok) {
+        ctx.ui.notify(`Tau: cannot continue session: ${check.error}`, "error");
+        return;
+      }
+      if (!ctx.isIdle()) {
+        ctx.ui.notify("Tau: agent is busy, wait for it to finish before continuing another session", "warning");
+        return;
+      }
+      const result = await ctx.switchSession(check.path);
+      if (result.cancelled) ctx.ui.notify("Tau: session switch was cancelled", "warning");
     },
   });
 
@@ -1080,6 +1148,46 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    // Continue a historical session in THIS Pi instance (like `pi -r`)
+    if (urlPath === "/api/sessions/continue" && req.method === "POST") {
+      if (!isSameOriginRequest(req)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Cross-origin request rejected" }));
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); if (body.length > 10000) req.destroy(); });
+      req.on("end", () => {
+        const reply = (status: number, payload: any) => {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        try {
+          const { filePath } = JSON.parse(body || "{}");
+          const check = validateContinueTarget(filePath);
+          if (!check.ok) return reply(check.status, { error: check.error, port: check.port });
+          if (!latestCtx) return reply(503, { error: "Pi session not ready yet" });
+          const current = latestCtx.sessionManager.getSessionFile() || "";
+          if (current && path.resolve(current) === check.path) return reply(200, { success: true, alreadyActive: true });
+          if (!latestCtx.isIdle()) return reply(409, { error: "The agent is busy. Wait for it to finish (or stop it) and try again." });
+
+          reply(202, { success: true, sessionFile: check.path, port: currentPort });
+          // Dispatch after the response is flushed: the switch tears down this
+          // runtime (and this HTTP server) and starts a fresh one.
+          setTimeout(() => {
+            try {
+              (pi as any).sendUserMessage(`/tau-continue ${encodeURIComponent(check.path)}`, { expandPromptTemplates: true });
+            } catch (e: any) {
+              console.error("[Mirror] continue session failed:", e?.message || e);
+            }
+          }, 50);
+        } catch (err: any) {
+          reply(400, { error: err.message });
+        }
+      });
+      return;
+    }
+
     // Session switch — in mirror mode, this is a no-op (session is controlled by TUI)
     if (urlPath === "/api/sessions/switch" && req.method === "POST") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1620,11 +1728,24 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       }
     }, 20000);
 
+    // After a session switch the previous runtime of this same process may
+    // still be releasing the port: retry it briefly so the browser can
+    // reconnect to the same URL instead of being moved to a new port.
+    const preferredPort = currentPort;
+    let sameProcessRetries = 0;
     const tryListen = (port: number, maxAttempts = 10) => {
       server!.listen(port, HOST, () => {
         onListening(port);
       });
       server!.once("error", (err: any) => {
+        if (err.code === "EADDRINUSE" && port === preferredPort && sameProcessRetries < 15) {
+          sameProcessRetries++;
+          setTimeout(() => {
+            server!.removeAllListeners("error");
+            tryListen(port, maxAttempts);
+          }, 200);
+          return;
+        }
         if (err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
           // Check if a stale Tau instance owns this port and kill it
           const instances = getRunningInstances();
@@ -1694,6 +1815,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         }
       }
 
+      currentPort = port;
+      (globalThis as any)[TAU_PORT_KEY] = port;
       mirrorUrl = `http://${localIp}:${port}`;
       tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : "";
       console.log(`[Mirror] Tau mirror server running on ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}`);
@@ -1706,7 +1829,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
     };
 
-    tryListen(PORT);
+    tryListen(preferredPort ?? PORT);
   }
 
   // ═══════════════════════════════════════

@@ -61,7 +61,7 @@ Type `/qr` in the terminal to show a QR code and scan it to access via your phon
 - Full-text search across all session history with highlighted snippets
 - Sorted by last modified (most recent first)
 - Live session marked with a green dot
-- Historical sessions are read-only
+- Historical sessions are read-only until you continue them: right-click a session (or use the button above the composer) and pick **Continue session** to resume it in the running Pi, the browser equivalent of `pi -r`. Sessions already live in another Pi instance offer **Go to live session** instead, so one file is never written by two processes
 - Inline session rename
 - Favourite sessions, tags, and filtering
 

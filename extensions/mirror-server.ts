@@ -293,7 +293,7 @@ export default function (pi: ExtensionAPI) {
 
   // ═══════════════════════════════════════
   // Optional: exit Pi when the last browser window closes
-  // Opt-in with TAU_EXIT_WHEN_CLOSED=<seconds> (the apPi launcher sets it).
+  // Opt-in with TAU_EXIT_WHEN_CLOSED=<seconds> (useful for launchers that start Pi only for the browser).
   // Waits for the agent to be idle and never exits while a tmux client is
   // attached to this Pi's terminal.
   // ═══════════════════════════════════════
